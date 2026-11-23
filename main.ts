@@ -4,7 +4,10 @@
  * Strategy (erasable TypeScript, bigint arithmetic only, deterministic,
  * no network, no clock, no randomness):
  *   - Ride the trend: go all-in when the latest close is above its
- *     120-bar simple moving average.
+ *     120-bar simple moving average AND the latest close is above the
+ *     previous bar's close (momentum confirmation, so we only enter on
+ *     an up bar instead of catching a falling knife while it is still
+ *     above the average).
  *   - Protect the ride: while long, track the highest close since entry
  *     and sell everything if the close falls 2% (200 bps) below that
  *     high-water mark (a trailing stop).
@@ -28,6 +31,7 @@ const MAX_SLIPPAGE_BPS = 200;
 const closes: bigint[] = []; // closes seen so far, oldest first
 let highWater: bigint | null = null; // highest close since entry (null while flat)
 let stopPrice: bigint | null = null; // close at which the last stop fired (null if never)
+let cooldownBars = 0; // bars left before re-entry is allowed after a stop-out
 
 await runBars({
   onBatch(state) {
@@ -37,6 +41,7 @@ await runBars({
     closes.push(BigInt(bar.c));
     if (closes.length < SMA_N) return [];
     const close = closes[closes.length - 1]!;
+    const prevClose = closes[closes.length - 2]!;
     const holding = state.positions.get(SYMBOL);
     const qty = holding === undefined ? 0n : holding.qty;
     if (qty > 0n) {
@@ -44,15 +49,22 @@ await runBars({
       if (close * 10000n < highWater * (10000n - TRAIL_BPS)) {
         stopPrice = close;
         highWater = null;
+        cooldownBars = 5;
         return [{ side: 'sell', symbol: SYMBOL, qty, max_slippage_bps: MAX_SLIPPAGE_BPS }];
       }
       return [];
     }
-    // Flat: enter only above the 120-bar average, and after a stop-out only
-    // once the price has recovered above the stop-out price.
+    // Flat: after a stop-out, wait out a 5-bar cooldown before any re-entry,
+    // then enter only above the 120-bar average with momentum confirmation
+    // (latest close above the previous bar's close), and only once the price
+    // has recovered above the stop-out price.
+    if (cooldownBars > 0) {
+      cooldownBars--;
+      return [];
+    }
     let sum = 0n;
     for (let i = closes.length - SMA_N; i < closes.length; i++) sum += closes[i]!;
-    if (close * BigInt(SMA_N) > sum) {
+    if (close * BigInt(SMA_N) > sum && close > prevClose) {
       if (stopPrice === null || close > stopPrice) {
         const room = state.weightRoom(SYMBOL);
         const amount = state.cash < room ? state.cash : room;
